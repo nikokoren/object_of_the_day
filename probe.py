@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Phase 1, part two. The first probe answered how deep the CC0 set is and
-what a record looks like. The questions left are the ones that decide
-whether this can work on e-ink at all:
+Phase 1, part three. Two things left before the harvester can be written.
 
-  - can Smithsonian images be resized the way LOC's IIIF resizes, or are
-    we stuck with whatever the collection happens to serve?
-  - what share of CC0 records even use the resizable host?
-  - which object types and which museums are worth offering as settings?
-
-Prints structure and counts only, never the key.
+  - The cat parameter (art_design, history_culture, science_technology)
+    should get us out of the natural-history specimens that dominate the
+    5.25M CC0 records. Does it, and what do those records look like?
+  - Does object photography survive a 1-bit panel at all? The maps
+    project learned to measure that rather than assume it, so the same
+    metric runs here on real objects before a line of harvester exists.
 """
 
+import io
 import json
 import os
+import statistics
 import sys
 import time
 import urllib.error
@@ -38,107 +38,116 @@ def api(path, params=None, label=""):
     except urllib.error.HTTPError as e:
         print("  FAIL {} HTTP {}".format(label or path, e.code))
     except Exception as e:
-        print("  FAIL {} {}: {}".format(label or path, type(e).__name__, e))
+        print("  FAIL {} {}".format(label or path, type(e).__name__))
     return None
 
 
-def probe_image(url, label):
-    """Fetch an image URL and report what came back, with pixel size."""
+def ark_of(row):
+    media = ((((row.get("content") or {}).get("descriptiveNonRepeating")
+               or {}).get("online_media") or {}).get("media") or [])
+    for m in media:
+        ids_id = str(m.get("idsId") or "")
+        if ids_id.startswith("ark:"):
+            return ids_id
+    return None
+
+
+def render_score(ark, width=400):
+    """The e-ink metric from the maps project: mush, detail, textiness."""
+    url = "https://ids.si.edu/ids/deliveryService/id/{}/{}".format(ark, width)
     try:
+        from PIL import Image, ImageFilter
         req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read()
-            ctype = resp.headers.get("Content-Type", "?")
-    except urllib.error.HTTPError as e:
-        print("    {:<34} HTTP {}".format(label, e.code))
-        return
-    except Exception as e:
-        print("    {:<34} {}".format(label, type(e).__name__))
-        return
-    dims = "?"
-    try:
-        from PIL import Image
-        import io
-        dims = "{}x{}".format(*Image.open(io.BytesIO(raw)).size)
+        raw = urllib.request.urlopen(req, timeout=45).read()
+        im = Image.open(io.BytesIO(raw)).convert("L")
     except Exception:
-        pass
-    print("    {:<34} {:<12} {:>9}B  {}".format(label, ctype, len(raw), dims))
-
-
-def media_of(row):
-    return ((((row.get("content") or {}).get("descriptiveNonRepeating") or {})
-             .get("online_media") or {}).get("media") or [])
+        return None
+    px = list(im.getdata())
+    n = len(px) or 1
+    ink = sum(1 for p in px if p < 90) / n
+    paper = sum(1 for p in px if p > 200) / n
+    mush = (1 - ink - paper) * 100
+    edges = im.filter(ImageFilter.FIND_EDGES).getdata()
+    detail = sum(edges) / float(len(edges) or 1)
+    w, h = im.size
+    load = im.load()
+    rows = [sum(load[x, y] for x in range(0, w, 2)) / (w / 2) for y in range(h)]
+    cols = [sum(load[x, y] for y in range(0, h, 2)) / (h / 2) for x in range(w)]
+    ralt = statistics.mean(abs(rows[i + 1] - rows[i]) for i in range(len(rows) - 1))
+    calt = statistics.mean(abs(cols[i + 1] - cols[i]) for i in range(len(cols) - 1))
+    return round(mush, 1), round(detail, 1), round(ralt / max(calt, 0.01), 2)
 
 
 def main():
     if not KEY:
-        print("SI_API_KEY missing")
         return 1
 
-    print("=== A. how many CC0 records use the resizable image host ===")
-    hosts = Counter()
-    arks = []
-    units = Counter()
-    types = Counter()
-    for start in (0, 1000, 50000, 250000):
-        d = api("/search", {"q": CC0, "rows": 100, "start": start},
-                "sample at {}".format(start))
-        rows = ((d or {}).get("response") or {}).get("rows") or []
-        for r in rows:
-            units[r.get("unitCode")] += 1
-            idx = (r.get("content") or {}).get("indexedStructured") or {}
-            for t in (idx.get("object_type") or []):
-                types[t] += 1
-            for m in media_of(r):
-                ids_id = str(m.get("idsId") or "")
-                hosts["ark (resizable)" if ids_id.startswith("ark:")
-                      else "collections host" if "collections." in ids_id
-                      else "other"] += 1
-                if ids_id.startswith("ark:") and len(arks) < 4:
-                    arks.append(ids_id)
-        time.sleep(1)
-    total = sum(hosts.values()) or 1
-    for k, v in hosts.most_common():
-        print("  {:<20} {:>5}  {:>3}%".format(k, v, round(100 * v / total)))
-    print("\n  units in the sample : {}".format(units.most_common(12)))
-    print("  object_type present : {}".format(types.most_common(15)))
-
-    print("\n=== B. can we resize? ===")
-    if not arks:
-        print("  no ark-based image found in the sample")
-    for ark in arks[:2]:
-        print("  {}".format(ark))
-        base = "https://ids.si.edu/ids/deliveryService/id/" + ark
-        probe_image(base, "deliveryService (no size)")
-        for size in (90, 400, 800, 1200):
-            probe_image("{}/{}".format(base, size),
-                        "deliveryService/{}".format(size))
-        iiif = "https://ids.si.edu/iiif/" + ark
-        probe_image(iiif + "/info.json", "iiif info.json")
-        probe_image(iiif + "/full/!800,480/0/default.jpg", "iiif !800,480 colour")
-        probe_image(iiif + "/full/!800,480/0/gray.jpg", "iiif !800,480 gray")
-        print()
-
-    print("=== C. how deep is each museum, CC0 with images ===")
-    for unit in ("CHNDM", "SAAM", "NPG", "FSG", "NASM", "NMAH", "NMAfA",
-                 "NMAI", "NPM", "SIL", "AAA", "HMSG", "ACM"):
-        d = api("/search", {"q": '{} AND unit_code:"{}"'.format(CC0, unit),
-                            "rows": 0}, unit)
+    print("=== A. does cat= narrow it, and how deep is each ===")
+    for cat in ("art_design", "history_culture", "science_technology"):
+        d = api("/category/{}/search".format(cat), {"q": CC0, "rows": 0}, cat)
         if d:
-            print("  {:<8} {}".format(
-                unit, ((d.get("response") or {}).get("rowCount"))))
+            print("  {:<20} {}".format(
+                cat, ((d.get("response") or {}).get("rowCount"))))
         time.sleep(0.5)
 
-    print("\n=== D. object types worth offering ===")
-    for ot in ("Photographs", "Prints", "Drawings", "Paintings", "Sculpture",
-               "Costume", "Furniture", "Aircraft", "Ceramic", "Textile",
-               "Posters", "Books", "Jewelry", "Medals", "Models"):
-        d = api("/search", {"q": '{} AND object_type:"{}"'.format(CC0, ot),
-                            "rows": 0}, ot)
-        if d:
-            print("  {:<14} {}".format(
-                ot, ((d.get("response") or {}).get("rowCount"))))
-        time.sleep(0.5)
+    print("\n=== B. what an art_design record carries ===")
+    d = api("/category/art_design/search", {"q": CC0, "rows": 60}, "art rows")
+    rows = ((d or {}).get("response") or {}).get("rows") or []
+    print("  {} rows".format(len(rows)))
+    units, types, with_ark = Counter(), Counter(), 0
+    for r in rows:
+        units[r.get("unitCode")] += 1
+        idx = (r.get("content") or {}).get("indexedStructured") or {}
+        for t in (idx.get("object_type") or []):
+            types[t] += 1
+        if ark_of(r):
+            with_ark += 1
+    print("  units      : {}".format(units.most_common(8)))
+    print("  types      : {}".format(types.most_common(12)))
+    print("  with ark   : {}/{}".format(with_ark, len(rows)))
+    if rows:
+        r = next((x for x in rows if ark_of(x)), rows[0])
+        c = r.get("content") or {}
+        idx = c.get("indexedStructured") or {}
+        ft = c.get("freetext") or {}
+        print("\n  a record:")
+        print("    title    : {}".format(str(r.get("title"))[:80]))
+        print("    unit     : {}  id: {}".format(r.get("unitCode"), r.get("id")))
+        print("    link     : {}".format(
+            str((c.get("descriptiveNonRepeating") or {}).get("record_link"))[:90]))
+        for k in ("object_type", "date", "name", "place", "topic", "culture"):
+            if idx.get(k):
+                print("    idx.{:<9}: {}".format(k, json.dumps(idx[k])[:110]))
+        for k in ("name", "date", "notes", "physicalDescription", "objectRights",
+                  "creditLine", "setName", "place"):
+            if ft.get(k):
+                print("    ft.{:<10}: {}".format(k, json.dumps(ft[k])[:200]))
+
+    print("\n=== C. does object photography survive a 1-bit panel ===")
+    print("  {:>6} {:>7} {:>6}  {:<28} title".format(
+        "mush", "detail", "text", "unit / type"))
+    scored = []
+    for r in rows[:22]:
+        ark = ark_of(r)
+        if not ark:
+            continue
+        s = render_score(ark)
+        if not s:
+            continue
+        idx = (r.get("content") or {}).get("indexedStructured") or {}
+        ot = (idx.get("object_type") or ["?"])[0]
+        scored.append(s)
+        print("  {:>6} {:>7} {:>6}  {:<28} {}".format(
+            s[0], s[1], s[2], "{}/{}".format(r.get("unitCode"), ot)[:28],
+            str(r.get("title"))[:40]))
+        time.sleep(0.3)
+    if scored:
+        good = [s for s in scored if s[0] < 45 and s[1] > 28 and s[2] < 2.5]
+        print("\n  {}/{} pass the maps thresholds (mush<45, detail>28, text<2.5)"
+              .format(len(good), len(scored)))
+        print("  median mush {:.0f}, median detail {:.0f}".format(
+            statistics.median(s[0] for s in scored),
+            statistics.median(s[1] for s in scored)))
     return 0
 
 
