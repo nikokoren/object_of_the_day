@@ -12,6 +12,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Install Pillow
+        run: pip install --quiet pillow
       - name: Probe the Smithsonian Open Access API
         env:
           SI_API_KEY: ${{ secrets.SI_API_KEY }}
