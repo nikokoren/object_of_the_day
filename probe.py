@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Phase 1, part five: the National Postal Museum.
+Phase 1, part six. Three questions, one run.
 
-Stamps are the best theoretical fit for e-ink in the whole collection --
-line engraving at a tiny original size, scanned large, often printed in
-two colours. This asks how many there are, what is known about each, and
-whether they hold up on a small grey panel and on the black/white/red/
-yellow one.
+  - Does the Postal Museum's CC0 set contain stamps at all? A 60-row
+    sample was all covers and correspondence, and every object_type
+    string I guessed returned zero, so the vocabulary has to be read off
+    the records rather than assumed.
+  - How do Air & Space and American History compare? Archival black and
+    white is a different proposition from an object on grey seamless.
+  - All three measured the same way, so the comparison means something.
 """
 
 import io
@@ -23,43 +25,42 @@ KEY = os.environ.get("SI_API_KEY", "")
 BASE = "https://api.si.edu/openaccess/api/v1.0"
 UA = "object-of-the-day/0.1 (github.com/nikokoren/object_of_the_day)"
 CC0 = 'online_media_type:"Images" AND usage:"CC0"'
-NPM = CC0 + ' AND unit_code:"NPM"'
 
 
-def api(path, params=None):
-    params = dict(params or {})
+def api(params):
+    params = dict(params)
     params["api_key"] = KEY
-    url = "{}{}?{}".format(BASE, path, urllib.parse.urlencode(params))
+    url = "{}/search?{}".format(BASE, urllib.parse.urlencode(params))
     try:
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
     except Exception as e:
-        print("  FAIL {} {}".format(path, type(e).__name__))
+        print("  FAIL {}".format(type(e).__name__))
     return None
 
 
-def count(q):
-    d = api("/search", {"q": q, "rows": 0})
-    return ((d or {}).get("response") or {}).get("rowCount")
-
-
-def media_of(row):
-    return ((((row.get("content") or {}).get("descriptiveNonRepeating")
-              or {}).get("online_media") or {}).get("media") or [])
+def rows_for(unit, n=200):
+    out = []
+    for start in range(0, n, 100):
+        d = api({"q": '{} AND unit_code:"{}"'.format(CC0, unit),
+                 "rows": 100, "start": start})
+        out += ((d or {}).get("response") or {}).get("rows") or []
+        time.sleep(0.4)
+    return out
 
 
 def image_url(row, size=800):
-    for m in media_of(row):
+    media = ((((row.get("content") or {}).get("descriptiveNonRepeating")
+               or {}).get("online_media") or {}).get("media") or [])
+    for m in media:
         content = str(m.get("content") or "")
         if "ids.si.edu" in content:
-            join = "&" if "?" in content else "?"
-            return "{}{}max={}".format(content, join, size)
+            return content + ("&" if "?" in content else "?") + "max=" + str(size)
     return None
 
 
 def analyse(url):
-    """Grey legibility plus how the colour would map to a 4-colour panel."""
     from PIL import Image, ImageFilter
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     raw = urllib.request.urlopen(req, timeout=45).read()
@@ -71,88 +72,74 @@ def analyse(url):
     n = len(px) or 1
     ink = sum(1 for p in px if p < 90) / n
     paper = sum(1 for p in px if p > 200) / n
-    mush = (1 - ink - paper) * 100
     edges = grey.filter(ImageFilter.FIND_EDGES).getdata()
-    detail = sum(edges) / float(len(edges) or 1)
     hsv = rgb.convert("HSV")
-    sat = [p[1] for p in hsv.getdata()]
     hues = [p[0] for p in hsv.getdata() if p[1] > 60]
     warm = sum(1 for h in hues if h < 30 or h > 225) / max(len(hues), 1)
-    return (round(mush, 1), round(detail, 1),
-            round(statistics.mean(sat), 1), round(100 * warm), rgb.size)
+    return ((1 - ink - paper) * 100, sum(edges) / float(len(edges) or 1),
+            100 * warm)
 
 
 def main():
     if not KEY:
         return 1
 
-    print("=== A. how many, and what kinds ===")
-    print("  NPM, CC0 with images: {}".format(count(NPM)))
-    for label, q in (
-            ("  postage stamps", NPM + ' AND object_type:"Postage Stamps"'),
-            ("  stamps (loose)", NPM + ' AND object_type:"Stamps"'),
-            ("  covers/envelopes", NPM + ' AND object_type:"Covers"'),
-            ("  essays & proofs", NPM + ' AND object_type:"Essays"'),
-            ("  postal stationery", NPM + ' AND object_type:"Postal stationery"')):
-        print("{:<22} {}".format(label, count(q)))
-        time.sleep(0.4)
-
-    d = api("/search", {"q": NPM, "rows": 60})
-    rows = ((d or {}).get("response") or {}).get("rows") or []
-    types, places, dates = Counter(), Counter(), Counter()
-    for r in rows:
+    print("=== A. does the Postal Museum hold stamps ===")
+    npm = rows_for("NPM", 200)
+    types = Counter()
+    for r in npm:
         idx = (r.get("content") or {}).get("indexedStructured") or {}
         for t in (idx.get("object_type") or []):
             types[t] += 1
-        for p in (idx.get("place") or []):
-            places[p] += 1
-        for x in (idx.get("date") or []):
-            dates[x] += 1
-    print("\n  object_type in 60 rows: {}".format(types.most_common(8)))
-    print("  places                : {}".format(places.most_common(6)))
-    print("  dates                 : {}".format(dates.most_common(8)))
+    print("  object_type over {} rows:".format(len(npm)))
+    for t, k in types.most_common(16):
+        print("    {:>4}  {}".format(k, t))
+    stampish = [t for t in types if "stamp" in t.lower()]
+    print("  anything with 'stamp' in it: {}".format(stampish or "none"))
+    for t in stampish[:4]:
+        d = api({"q": '{} AND unit_code:"NPM" AND object_type:"{}"'.format(CC0, t),
+                 "rows": 0})
+        print("    {:<34} {}".format(
+            t, ((d or {}).get("response") or {}).get("rowCount")))
+        time.sleep(0.4)
 
-    print("\n=== B. what is known about one stamp ===")
-    r = next((x for x in rows if image_url(x)), rows[0] if rows else None)
-    if r:
-        c = r.get("content") or {}
-        idx = c.get("indexedStructured") or {}
-        ft = c.get("freetext") or {}
-        print("  title : {}".format(str(r.get("title"))[:90]))
-        print("  id    : {}".format(r.get("id")))
-        print("  link  : {}".format(
-            str((c.get("descriptiveNonRepeating") or {}).get("record_link"))[:90]))
-        for k in sorted(idx):
-            print("  idx.{:<14}: {}".format(k, json.dumps(idx[k])[:130]))
-        for k in sorted(ft):
-            print("  ft.{:<15}: {}".format(k, json.dumps(ft[k])[:260]))
-        print("  image : {}".format(image_url(r)))
-
-    print("\n=== C. on a grey panel, and on the four-colour one ===")
-    print("  {:>6} {:>7} {:>6} {:>6}  {:<14} title".format(
-        "mush", "detail", "sat", "warm%", "size"))
-    got = []
-    for r in rows[:16]:
-        url = image_url(r)
-        if not url:
+    print("\n=== B. the three museums, measured the same way ===")
+    for unit, label in (("NPM", "Postal Museum"),
+                        ("NASM", "Air & Space"),
+                        ("NMAH", "American History")):
+        rows = npm if unit == "NPM" else rows_for(unit, 100)
+        got, titles = [], []
+        for r in rows:
+            if len(got) >= 14:
+                break
+            url = image_url(r)
+            if not url:
+                continue
+            try:
+                got.append(analyse(url))
+                titles.append(str(r.get("title"))[:46])
+            except Exception:
+                continue
+            time.sleep(0.25)
+        if not got:
+            print("  {:<18} nothing measurable".format(label))
             continue
-        try:
-            mush, detail, sat, warm, size = analyse(url)
-        except Exception:
-            continue
-        got.append((mush, detail, sat, warm))
-        print("  {:>6} {:>7} {:>6} {:>5}%  {:<14} {}".format(
-            mush, detail, sat, warm, "{}x{}".format(*size),
-            str(r.get("title"))[:44]))
-        time.sleep(0.3)
-    if got:
-        print("\n  median mush {:.0f}  detail {:.0f}  saturation {:.0f}  warm {:.0f}%"
-              .format(statistics.median(g[0] for g in got),
+        print("  {:<18} n={:<3} mush {:>4.0f}  detail {:>4.0f}  warm {:>3.0f}%"
+              .format(label, len(got),
+                      statistics.median(g[0] for g in got),
                       statistics.median(g[1] for g in got),
-                      statistics.median(g[2] for g in got),
-                      statistics.median(g[3] for g in got)))
-        print("  (warm% = share of saturated pixels that are red/orange/yellow,")
-        print("   i.e. colour a black/white/red/yellow panel can actually show)")
+                      statistics.median(g[2] for g in got)))
+        best = sorted(range(len(got)), key=lambda i: -got[i][1])[:4]
+        for i in best:
+            print("      detail {:>4.0f}  mush {:>4.0f}  {}".format(
+                got[i][1], got[i][0], titles[i]))
+        types = Counter()
+        for r in rows:
+            idx = (r.get("content") or {}).get("indexedStructured") or {}
+            for t in (idx.get("object_type") or []):
+                types[t] += 1
+        print("      types: {}".format(
+            ", ".join("{} ({})".format(t, k) for t, k in types.most_common(6))))
     return 0
 
 
